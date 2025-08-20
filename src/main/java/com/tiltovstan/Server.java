@@ -1,126 +1,239 @@
-import java.io.BufferedReader;
-import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.PrintWriter;
-import java.net.ServerSocket;
-import java.net.Socket;
-import java.util.ArrayList;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+package com.tiltovstan;
 
-public class Server implements Runnable {
+import java.io.*;
+import java.net.*;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
-    private final ArrayList<ConnectionHandler> connections;
-    private ServerSocket server;
-    private boolean done;
-    private ExecutorService pool;
+public class Server {
+    private static final int PORT = 5050;
+    private static final String USER_FILE = "users.txt";
+    private static final String ROOM_FILE = "rooms.txt";
+    private static final Map<ClientHandler, String> activeUsers = new ConcurrentHashMap<>();
+    private static final Map<String, Set<ClientHandler>> rooms = new ConcurrentHashMap<>();
 
-    public Server() {
-        connections = new ArrayList<>();
-        done = false;
-    }
+    public static void main(String[] args) {
+        System.out.println("Chat server started on port " + PORT);
 
-    @Override
-    public void run() {
-        try {
-            server = new ServerSocket(9999);
-            pool = Executors.newCachedThreadPool();
-            while (!done) {
-                Socket client = server.accept();
-                ConnectionHandler handler = new ConnectionHandler(client);
-                connections.add(handler);
-                pool.execute(handler);
-            }
-        } catch (Exception e) {
-            shutdown();
-        }
-    }
+        loadRooms();
 
-    public void broadcast(String message) {
-        for (ConnectionHandler ch : connections) {
-            if (ch != null) {
-                ch.sendMessage(message);
-            }
-        }
-    }
-
-    public void shutdown() {
-        try {
-            done = true;
-            pool.shutdown();
-            if (!server.isClosed()) {
-                server.close();
-            }
-            for (ConnectionHandler ch : connections) {
-                ch.shutdown();
+        try (ServerSocket serverSocket = new ServerSocket(PORT)) {
+            while (true) {
+                Socket socket = serverSocket.accept();
+                new Thread(new ClientHandler(socket)).start();
             }
         } catch (IOException e) {
-            // ignore
+            e.printStackTrace();
         }
     }
 
-    class ConnectionHandler implements Runnable {
+    private static void loadRooms() {
+        try {
+            File file = new File(ROOM_FILE);
+            if (!file.exists()) {
+                try (FileWriter writer = new FileWriter(file)) {
+                    writer.write("general\n");
+                }
+            }
 
-        private final Socket client;
-        private BufferedReader in;
+            try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    rooms.putIfAbsent(line.trim(), ConcurrentHashMap.newKeySet());
+                }
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private static synchronized boolean createRoom(String room) {
+        try {
+            File file = new File(ROOM_FILE);
+            try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    if (line.trim().equalsIgnoreCase(room)) {
+                        return false;
+                    }
+                }
+            }
+
+            try (FileWriter writer = new FileWriter(file, true)) {
+                writer.write(room + "\n");
+            }
+            rooms.putIfAbsent(room, ConcurrentHashMap.newKeySet());
+            return true;
+        } catch (IOException e) {
+            e.printStackTrace();
+            return false;
+        }
+    }
+
+    static class ClientHandler implements Runnable {
+        private final Socket socket;
         private PrintWriter out;
+        private BufferedReader in;
+        private String username = null;
+        private String currentRoom = null;
 
-        public ConnectionHandler(Socket client) {
-            this.client = client;
+        ClientHandler(Socket socket) {
+            this.socket = socket;
         }
 
         @Override
         public void run() {
             try {
-                out = new PrintWriter(client.getOutputStream(), true);
-                in = new BufferedReader(new InputStreamReader(client.getInputStream()));
-                out.println("Please enter a nickname: ");
-                String nickname = in.readLine();
-                System.out.println(nickname + " connected!");
-                broadcast(nickname + " joined the chat!");
-                String message;
-                while ((message = in.readLine()) != null) {
-                    if (message.startsWith("/nick ")) {
-                        String[] messageSplit = message.split(" ", 2);
-                        if (messageSplit.length == 2) {
-                            broadcast(nickname + " renamed themselves to " + messageSplit[1]);
-                            System.out.println(nickname + " renamed themselves to " + messageSplit[1]);
-                            nickname = messageSplit[1];
-                            out.println("Successfully changed nickname to " + nickname);
-                        } else {
-                            out.println("No nickname provided!");
+                in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+                out = new PrintWriter(socket.getOutputStream(), true);
+
+                String line;
+                while ((line = in.readLine()) != null) {
+                    handleMessage(line.trim());
+                }
+            } catch (IOException e) {
+                System.out.println("Client disconnected: " + username);
+            } finally {
+                cleanup();
+            }
+        }
+
+        private void handleMessage(String json) {
+            if (json.contains("\"type\":\"register\"")) {
+                String user = extractValue(json, "username");
+                String pass = extractValue(json, "password");
+                if (registerUser(user, pass)) {
+                    sendJson("{\"type\":\"success\",\"message\":\"Registration successful\"}");
+                } else {
+                    sendJson("{\"type\":\"error\",\"message\":\"User already exists\"}");
+                }
+            }
+
+            else if (json.contains("\"type\":\"login\"")) {
+                String user = extractValue(json, "username");
+                String pass = extractValue(json, "password");
+                if (validateUser(user, pass)) {
+                    this.username = user;
+                    activeUsers.put(this, user);
+                    sendJson("{\"type\":\"success\",\"message\":\"Login successful\"}");
+                } else {
+                    sendJson("{\"type\":\"error\",\"message\":\"Invalid username/password\"}");
+                }
+            }
+
+            else if (json.contains("\"type\":\"create_room\"")) {
+                if (username == null) {
+                    sendJson("{\"type\":\"error\",\"message\":\"Login required\"}");
+                    return;
+                }
+                String room = extractValue(json, "room");
+                if (createRoom(room)) {
+                    sendJson("{\"type\":\"success\",\"message\":\"Room created\"}");
+                } else {
+                    sendJson("{\"type\":\"error\",\"message\":\"Room already exists\"}");
+                }
+            }
+
+            else if (json.contains("\"type\":\"list_rooms\"")) {
+                sendRoomList();
+            }
+
+            else if (json.contains("\"type\":\"join\"")) {
+                if (username == null) {
+                    sendJson("{\"type\":\"error\",\"message\":\"Login required\"}");
+                    return;
+                }
+                String room = extractValue(json, "room");
+                rooms.putIfAbsent(room, ConcurrentHashMap.newKeySet());
+                rooms.get(room).add(this);
+                currentRoom = room;
+                sendJson("{\"type\":\"success\",\"message\":\"Joined room " + room + "\"}");
+            }
+
+            else if (json.contains("\"type\":\"message\"")) {
+                if (username == null || currentRoom == null) {
+                    sendJson("{\"type\":\"error\",\"message\":\"Join a room first\"}");
+                    return;
+                }
+                String text = extractValue(json, "text");
+                String msg = "{\"type\":\"message\",\"room\":\"" + currentRoom + "\",\"nick\":\"" + username + "\",\"text\":\"" + text + "\"}";
+                broadcast(currentRoom, msg);
+            }
+
+            else {
+                sendJson("{\"type\":\"error\",\"message\":\"Unknown command\"}");
+            }
+        }
+
+        private void sendRoomList() {
+            String allRooms = String.join("\",\"", rooms.keySet());
+            sendJson("{\"type\":\"room_list\",\"rooms\":[\"" + allRooms + "\"]}");
+        }
+
+        private void sendJson(String msg) {
+            out.println(msg);
+        }
+
+        private void broadcast(String room, String msg) {
+            if (rooms.containsKey(room)) {
+                for (ClientHandler client : rooms.get(room)) {
+                    client.sendJson(msg);
+                }
+            }
+        }
+
+        private void cleanup() {
+            activeUsers.remove(this);
+            if (currentRoom != null) {
+                rooms.get(currentRoom).remove(this);
+            }
+        }
+
+        private synchronized boolean registerUser(String username, String password) {
+            try {
+                File file = new File(USER_FILE);
+                if (!file.exists()) file.createNewFile();
+
+                try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        if (line.startsWith(username + ":")) {
+                            return false;
                         }
-                    } else if (message.startsWith("/quit")) {
-                        broadcast(nickname + " left the chat!");
-                        shutdown();
-                    } else {
-                        broadcast(nickname + ": " + message);
+                    }
+                }
+
+                try (FileWriter writer = new FileWriter(file, true)) {
+                    writer.write(username + ":" + password + "\n");
+                }
+                return true;
+            } catch (IOException e) {
+                e.printStackTrace();
+                return false;
+            }
+        }
+
+        private boolean validateUser(String username, String password) {
+            try (BufferedReader reader = new BufferedReader(new FileReader(USER_FILE))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    if (line.equals(username + ":" + password)) {
+                        return true;
                     }
                 }
             } catch (IOException e) {
-                shutdown();
+                e.printStackTrace();
             }
+            return false;
         }
 
-        public void sendMessage(String message) {
-            out.println(message);
+        private String extractValue(String json, String key) {
+            String pattern = "\"" + key + "\":\"";
+            int start = json.indexOf(pattern);
+            if (start == -1) return "";
+            start += pattern.length();
+            int end = json.indexOf("\"", start);
+            return json.substring(start, end);
         }
-
-        public void shutdown() {
-            try {
-                in.close();
-                out.close();
-                if (!client.isClosed()) {
-                    client.close();
-                }
-            } catch (IOException e) {
-                // ignore
-            }
-        }
-    }
-
-    public static void main(String[] args) {
-        Server server = new Server();
-        server.run();
     }
 }
