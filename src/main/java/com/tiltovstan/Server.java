@@ -11,6 +11,8 @@ public class Server {
     private static final String ROOM_FILE = "rooms.txt";
     private static final Map<ClientHandler, String> activeUsers = new ConcurrentHashMap<>();
     private static final Map<String, Set<ClientHandler>> rooms = new ConcurrentHashMap<>();
+    private static final Map<String, Deque<String>> roomHistory = new ConcurrentHashMap<>();
+    private static final int MAX_HISTORY = 20;
 
     public static void main(String[] args) {
         System.out.println("Chat server started on port " + PORT);
@@ -35,11 +37,12 @@ public class Server {
                     writer.write("general\n");
                 }
             }
-
             try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
                 String line;
                 while ((line = reader.readLine()) != null) {
-                    rooms.putIfAbsent(line.trim(), ConcurrentHashMap.newKeySet());
+                    String room = line.trim();
+                    rooms.putIfAbsent(room, ConcurrentHashMap.newKeySet());
+                    roomHistory.putIfAbsent(room, new ArrayDeque<>());
                 }
             }
         } catch (IOException e) {
@@ -53,16 +56,14 @@ public class Server {
             try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
                 String line;
                 while ((line = reader.readLine()) != null) {
-                    if (line.trim().equalsIgnoreCase(room)) {
-                        return false;
-                    }
+                    if (line.trim().equalsIgnoreCase(room)) return false;
                 }
             }
-
             try (FileWriter writer = new FileWriter(file, true)) {
                 writer.write(room + "\n");
             }
             rooms.putIfAbsent(room, ConcurrentHashMap.newKeySet());
+            roomHistory.putIfAbsent(room, new ArrayDeque<>());
             return true;
         } catch (IOException e) {
             e.printStackTrace();
@@ -121,11 +122,12 @@ public class Server {
                 }
             }
 
+            else if (json.contains("\"type\":\"logout\"")) {
+                sendJson("{\"type\":\"success\",\"message\":\"Logged out\"}");
+                cleanup();
+            }
+
             else if (json.contains("\"type\":\"create_room\"")) {
-                if (username == null) {
-                    sendJson("{\"type\":\"error\",\"message\":\"Login required\"}");
-                    return;
-                }
                 String room = extractValue(json, "room");
                 if (createRoom(room)) {
                     sendJson("{\"type\":\"success\",\"message\":\"Room created\"}");
@@ -139,15 +141,61 @@ public class Server {
             }
 
             else if (json.contains("\"type\":\"join\"")) {
-                if (username == null) {
-                    sendJson("{\"type\":\"error\",\"message\":\"Login required\"}");
-                    return;
-                }
                 String room = extractValue(json, "room");
                 rooms.putIfAbsent(room, ConcurrentHashMap.newKeySet());
+                roomHistory.putIfAbsent(room, new ArrayDeque<>());
                 rooms.get(room).add(this);
                 currentRoom = room;
+                
+                Deque<String> history = roomHistory.get(room);
+                if (!history.isEmpty()) {
+                    StringBuilder sb = new StringBuilder("{\"type\":\"history\",\"room\":\"" + room + "\",\"messages\":[");
+                    sb.append(String.join(",", history));
+                    sb.append("]}");
+                    sendJson(sb.toString());
+                }
+
                 sendJson("{\"type\":\"success\",\"message\":\"Joined room " + room + "\"}");
+            }
+
+            else if (json.contains("\"type\":\"leave\"")) {
+                if (currentRoom != null) {
+                    rooms.get(currentRoom).remove(this);
+                    sendJson("{\"type\":\"success\",\"message\":\"Left room " + currentRoom + "\"}");
+                    currentRoom = null;
+                }
+            }
+
+            else if (json.contains("\"type\":\"room_users\"")) {
+                String room = extractValue(json, "room");
+                if (rooms.containsKey(room)) {
+                    String users = rooms.get(room).stream()
+                            .map(c -> c.username)
+                            .filter(Objects::nonNull)
+                            .reduce((a, b) -> a + "\",\"" + b)
+                            .orElse("");
+                    sendJson("{\"type\":\"room_users\",\"room\":\"" + room + "\",\"users\":[\"" + users + "\"]}");
+                }
+            }
+
+            else if (json.contains("\"type\":\"user_list\"")) {
+                String users = String.join("\",\"", activeUsers.values());
+                sendJson("{\"type\":\"user_list\",\"users\":[\"" + users + "\"]}");
+            }
+
+            else if (json.contains("\"type\":\"direct_message\"")) {
+                String toUser = extractValue(json, "to");
+                String text = extractValue(json, "text");
+
+                for (Map.Entry<ClientHandler, String> entry : activeUsers.entrySet()) {
+                    if (entry.getValue().equals(toUser)) {
+                        String msg = "{\"type\":\"direct_message\",\"from\":\"" + username + "\",\"text\":\"" + text + "\"}";
+                        entry.getKey().sendJson(msg);
+                        sendJson("{\"type\":\"success\",\"message\":\"DM sent to " + toUser + "\"}");
+                        return;
+                    }
+                }
+                sendJson("{\"type\":\"error\",\"message\":\"User not found\"}");
             }
 
             else if (json.contains("\"type\":\"message\"")) {
@@ -157,6 +205,12 @@ public class Server {
                 }
                 String text = extractValue(json, "text");
                 String msg = "{\"type\":\"message\",\"room\":\"" + currentRoom + "\",\"nick\":\"" + username + "\",\"text\":\"" + text + "\"}";
+
+                // Save to history
+                Deque<String> history = roomHistory.get(currentRoom);
+                if (history.size() >= MAX_HISTORY) history.removeFirst();
+                history.addLast(msg);
+
                 broadcast(currentRoom, msg);
             }
 
@@ -193,16 +247,12 @@ public class Server {
             try {
                 File file = new File(USER_FILE);
                 if (!file.exists()) file.createNewFile();
-
                 try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
                     String line;
                     while ((line = reader.readLine()) != null) {
-                        if (line.startsWith(username + ":")) {
-                            return false;
-                        }
+                        if (line.startsWith(username + ":")) return false;
                     }
                 }
-
                 try (FileWriter writer = new FileWriter(file, true)) {
                     writer.write(username + ":" + password + "\n");
                 }
@@ -217,9 +267,7 @@ public class Server {
             try (BufferedReader reader = new BufferedReader(new FileReader(USER_FILE))) {
                 String line;
                 while ((line = reader.readLine()) != null) {
-                    if (line.equals(username + ":" + password)) {
-                        return true;
-                    }
+                    if (line.equals(username + ":" + password)) return true;
                 }
             } catch (IOException e) {
                 e.printStackTrace();
