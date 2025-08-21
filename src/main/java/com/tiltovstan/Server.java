@@ -7,11 +7,11 @@ import java.util.concurrent.ConcurrentHashMap;
 
 public class Server {
     private static final int PORT = 5050;
-    private static final String USER_FILE = "users.txt";   // << Stores users
-    private static final String ROOM_FILE = "rooms.txt";   // << Stores rooms
-    private static final Map<ClientHandler, String> activeUsers = new ConcurrentHashMap<>(); // << Logged in users
-    private static final Map<String, Set<ClientHandler>> rooms = new ConcurrentHashMap<>();  // << Rooms with members
-    private static final Map<String, Deque<String>> roomHistory = new ConcurrentHashMap<>(); // << Message history per room
+    private static final String USER_FILE = "users.txt";
+    private static final String ROOM_FILE = "rooms.txt";
+    private static final Map<ClientHandler, String> activeUsers = new ConcurrentHashMap<>();
+    private static final Map<String, Set<ClientHandler>> rooms = new ConcurrentHashMap<>(); 
+    private static final Map<String, Deque<String>> roomHistory = new ConcurrentHashMap<>(); 
     private static final int MAX_HISTORY = 20;
 
     public static void main(String[] args) {
