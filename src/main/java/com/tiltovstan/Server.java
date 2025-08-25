@@ -9,14 +9,20 @@ public class Server {
     private static final int PORT = 5050;
     private static final String USER_FILE = "users.txt";
     private static final String ROOM_FILE = "rooms.txt";
+
+    // Active users: session -> username
     private static final Map<ClientHandler, String> activeUsers = new ConcurrentHashMap<>();
-    private static final Map<String, Set<ClientHandler>> rooms = new ConcurrentHashMap<>(); 
-    private static final Map<String, Deque<String>> roomHistory = new ConcurrentHashMap<>(); 
+    // Rooms: room -> set of clients
+    private static final Map<String, Set<ClientHandler>> rooms = new ConcurrentHashMap<>();
+    // Room message history (last N messages)
+    private static final Map<String, Deque<String>> roomHistory = new ConcurrentHashMap<>();
     private static final int MAX_HISTORY = 20;
+
+    // DM history: (user1:user2) -> messages
+    private static final Map<String, Deque<String>> dmHistory = new ConcurrentHashMap<>();
 
     public static void main(String[] args) {
         System.out.println("Chat server started on port " + PORT);
-
         loadRooms();
 
         try (ServerSocket serverSocket = new ServerSocket(PORT)) {
@@ -29,12 +35,11 @@ public class Server {
         }
     }
 
-    //проверка комнат которые есть в листе
+    // ----- Load rooms -----
     private static void loadRooms() {
         try {
             File file = new File(ROOM_FILE);
             if (!file.exists()) {
-                // стандартная комната
                 try (FileWriter writer = new FileWriter(file)) {
                     writer.write("general\n");
                 }
@@ -51,17 +56,19 @@ public class Server {
             e.printStackTrace();
         }
     }
+
+    // ----- Create room -----
     private static synchronized boolean createRoom(String room) {
         try {
             File file = new File(ROOM_FILE);
             try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
                 String line;
                 while ((line = reader.readLine()) != null) {
-                    if (line.trim().equalsIgnoreCase(room)) return false; // already exists
+                    if (line.trim().equalsIgnoreCase(room)) return false;
                 }
             }
             try (FileWriter writer = new FileWriter(file, true)) {
-                writer.write(room + "\n"); // save to file
+                writer.write(room + "\n");
             }
             rooms.putIfAbsent(room, ConcurrentHashMap.newKeySet());
             roomHistory.putIfAbsent(room, new ArrayDeque<>());
@@ -71,6 +78,15 @@ public class Server {
             return false;
         }
     }
+
+    // ----- Get key for DM history -----
+    private static String getDmKey(String user1, String user2) {
+        List<String> pair = Arrays.asList(user1, user2);
+        Collections.sort(pair);
+        return pair.get(0) + ":" + pair.get(1);
+    }
+
+    // ================= CLIENT HANDLER =================
     static class ClientHandler implements Runnable {
         private final Socket socket;
         private PrintWriter out;
@@ -90,7 +106,7 @@ public class Server {
 
                 String line;
                 while ((line = in.readLine()) != null) {
-                    handleMessage(line.trim()); // << Handle JSON command
+                    handleMessage(line.trim());
                 }
             } catch (IOException e) {
                 System.out.println("Client disconnected: " + username);
@@ -98,8 +114,9 @@ public class Server {
                 cleanup();
             }
         }
+
         private void handleMessage(String json) {
-            // регестарция полбзователь
+            // --- Register ---
             if (json.contains("\"type\":\"register\"")) {
                 String user = extractValue(json, "username");
                 String pass = extractValue(json, "password");
@@ -110,26 +127,26 @@ public class Server {
                 }
             }
 
-            // логин
+            // --- Login ---
             else if (json.contains("\"type\":\"login\"")) {
                 String user = extractValue(json, "username");
                 String pass = extractValue(json, "password");
                 if (validateUser(user, pass)) {
                     this.username = user;
-                    activeUsers.put(this, user); // проверка на онлайн
+                    activeUsers.put(this, user);
                     sendJson("{\"type\":\"success\",\"message\":\"Login successful\"}");
                 } else {
                     sendJson("{\"type\":\"error\",\"message\":\"Invalid username/password\"}");
                 }
             }
 
-            // выход из аккаунта
+            // --- Logout ---
             else if (json.contains("\"type\":\"logout\"")) {
                 sendJson("{\"type\":\"success\",\"message\":\"Logged out\"}");
                 cleanup();
             }
 
-            // создание комнаты
+            // --- Create Room ---
             else if (json.contains("\"type\":\"create_room\"")) {
                 String room = extractValue(json, "room");
                 if (createRoom(room)) {
@@ -139,12 +156,12 @@ public class Server {
                 }
             }
 
-            // лист комнат
+            // --- List Rooms ---
             else if (json.contains("\"type\":\"list_rooms\"")) {
                 sendRoomList();
             }
 
-            // конект к комнате
+            // --- Join Room ---
             else if (json.contains("\"type\":\"join\"")) {
                 String room = extractValue(json, "room");
                 rooms.putIfAbsent(room, ConcurrentHashMap.newKeySet());
@@ -152,7 +169,7 @@ public class Server {
                 rooms.get(room).add(this);
                 currentRoom = room;
 
-                // последние сообщения в комнате
+                // Send last messages
                 Deque<String> history = roomHistory.get(room);
                 if (!history.isEmpty()) {
                     StringBuilder sb = new StringBuilder("{\"type\":\"history\",\"room\":\"" + room + "\",\"messages\":[");
@@ -164,7 +181,7 @@ public class Server {
                 sendJson("{\"type\":\"success\",\"message\":\"Joined room " + room + "\"}");
             }
 
-            // выход из комнаты
+            // --- Leave Room ---
             else if (json.contains("\"type\":\"leave\"")) {
                 if (currentRoom != null) {
                     rooms.get(currentRoom).remove(this);
@@ -172,6 +189,8 @@ public class Server {
                     currentRoom = null;
                 }
             }
+
+            // --- Room Users ---
             else if (json.contains("\"type\":\"room_users\"")) {
                 String room = extractValue(json, "room");
                 if (rooms.containsKey(room)) {
@@ -184,27 +203,64 @@ public class Server {
                 }
             }
 
-            // лист юзеров в сети
+            // --- User List ---
             else if (json.contains("\"type\":\"user_list\"")) {
                 String users = String.join("\",\"", activeUsers.values());
                 sendJson("{\"type\":\"user_list\",\"users\":[\"" + users + "\"]}");
             }
 
-            // личка
-            else if (json.contains("\"type\":\"direct_message\"")) {   // <<<<<<<<<<<<<<<< DMs START
+            // --- Direct Message ---
+            else if (json.contains("\"type\":\"direct_message\"")) {
                 String toUser = extractValue(json, "to");
                 String text = extractValue(json, "text");
 
                 for (Map.Entry<ClientHandler, String> entry : activeUsers.entrySet()) {
                     if (entry.getValue().equals(toUser)) {
                         String msg = "{\"type\":\"direct_message\",\"from\":\"" + username + "\",\"text\":\"" + text + "\"}";
-                        entry.getKey().sendJson(msg); // << send DM to recipient
+                        entry.getKey().sendJson(msg);
+
+                        // Save to DM history
+                        String key = getDmKey(username, toUser);
+                        dmHistory.putIfAbsent(key, new ArrayDeque<>());
+                        Deque<String> history = dmHistory.get(key);
+                        if (history.size() >= MAX_HISTORY) history.removeFirst();
+                        history.addLast(msg);
+
                         sendJson("{\"type\":\"success\",\"message\":\"DM sent to " + toUser + "\"}");
                         return;
                     }
                 }
                 sendJson("{\"type\":\"error\",\"message\":\"User not found\"}");
             }
+
+            // --- DM History ---
+            else if (json.contains("\"type\":\"dm_history\"")) {
+                String withUser = extractValue(json, "with");
+                String key = getDmKey(username, withUser);
+                Deque<String> history = dmHistory.getOrDefault(key, new ArrayDeque<>());
+                StringBuilder sb = new StringBuilder("{\"type\":\"dm_history\",\"with\":\"" + withUser + "\",\"messages\":[");
+                sb.append(String.join(",", history));
+                sb.append("]}");
+                sendJson(sb.toString());
+            }
+
+            // --- Typing Indicator ---
+            else if (json.contains("\"type\":\"typing\"")) {
+                String room = extractValue(json, "room");
+                String msg = "{\"type\":\"typing\",\"room\":\"" + room + "\",\"nick\":\"" + username + "\"}";
+                broadcast(room, msg);
+            }
+
+            // --- Reaction ---
+            else if (json.contains("\"type\":\"reaction\"")) {
+                String room = extractValue(json, "room");
+                String msgId = extractValue(json, "msg");
+                String emoji = extractValue(json, "emoji");
+                String msg = "{\"type\":\"reaction\",\"room\":\"" + room + "\",\"msg\":\"" + msgId + "\",\"nick\":\"" + username + "\",\"emoji\":\"" + emoji + "\"}";
+                broadcast(room, msg);
+            }
+
+            // --- Room Message ---
             else if (json.contains("\"type\":\"message\"")) {
                 if (username == null || currentRoom == null) {
                     sendJson("{\"type\":\"error\",\"message\":\"Join a room first\"}");
@@ -220,17 +276,23 @@ public class Server {
 
                 broadcast(currentRoom, msg);
             }
+
+            // --- Unknown ---
             else {
                 sendJson("{\"type\":\"error\",\"message\":\"Unknown command\"}");
             }
         }
+
+        // ----- Helpers -----
         private void sendRoomList() {
             String allRooms = String.join("\",\"", rooms.keySet());
             sendJson("{\"type\":\"room_list\",\"rooms\":[\"" + allRooms + "\"]}");
         }
+
         private void sendJson(String msg) {
             out.println(msg);
         }
+
         private void broadcast(String room, String msg) {
             if (rooms.containsKey(room)) {
                 for (ClientHandler client : rooms.get(room)) {
@@ -238,6 +300,7 @@ public class Server {
                 }
             }
         }
+
         private void cleanup() {
             activeUsers.remove(this);
             if (currentRoom != null) {
@@ -245,7 +308,6 @@ public class Server {
             }
         }
 
-        // как пишеться users.txt
         private synchronized boolean registerUser(String username, String password) {
             try {
                 File file = new File(USER_FILE);
@@ -265,6 +327,7 @@ public class Server {
                 return false;
             }
         }
+
         private boolean validateUser(String username, String password) {
             try (BufferedReader reader = new BufferedReader(new FileReader(USER_FILE))) {
                 String line;
@@ -276,6 +339,7 @@ public class Server {
             }
             return false;
         }
+
         private String extractValue(String json, String key) {
             String pattern = "\"" + key + "\":\"";
             int start = json.indexOf(pattern);
